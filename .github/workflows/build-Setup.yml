@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       override_version:
-        description: "Override version string (e.g. 2.8.0). Leave empty to auto-detect from CMakeLists.txt."
+        # description: "Override version string (e.g. 2.8.0). Leave empty to auto-detect from CMakeLists.txt."
         required: false
         default: ""
       build_type:
@@ -69,10 +69,10 @@ jobs:
 
     steps:
       # =================================================================
-      # 1. Checkout source code
+      # 1. Checkout source code (v6 supports Node.js 24)
       # =================================================================
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -108,7 +108,7 @@ jobs:
           arch: amd64
 
       # =================================================================
-      # 4. Install Qt 6
+      # 4. Install Qt 6 (cached automatically)
       #    KeePassXC needs Core, Network, Concurrent, Gui, Svg, Widgets, Test, LinguistTools.
       #    The default Qt installation includes all necessary modules.
       #    No explicit modules list required (avoids aqt parser errors for qtsvg).
@@ -142,6 +142,7 @@ jobs:
       #    CMakeLists.txt L704 adds CMAKE_TOOLCHAIN_FILE automatically.
       # =================================================================
       - name: Setup vcpkg
+        id: vcpkg
         shell: pwsh
         run: |
           # Use the vcpkg bundled with the GitHub Actions runner
@@ -173,7 +174,19 @@ jobs:
           Write-Host "vcpkg toolchain: $toolchainFile"
 
       # =================================================================
-      # 7. Install WiX v3 for MSI packaging
+      # 7. Cache vcpkg binary artifacts (speeds up subsequent builds)
+      # =================================================================
+      - name: Cache vcpkg dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}\installed
+            ${{ env.VCPKG_ROOT }}\buildtrees
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      # =================================================================
+      # 8. Install WiX v3 for MSI packaging
       #    src/CMakeLists.txt L474: set(CPACK_GENERATOR "ZIP;WIX")
       #    WiX v3 is required (not v4) because CPack's WIX generator
       #    uses WiX v3 candle.exe/light.exe directly.
@@ -192,7 +205,6 @@ jobs:
             Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRetryCount 3
             Start-Process -FilePath $installer -ArgumentList "/quiet", "/norestart" -Wait
 
-            # Locate the installed WiX bin directory
             $candidates = @(
               "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin",
               "${env:ProgramFiles}\WiX Toolset v3.14\bin"
@@ -206,28 +218,16 @@ jobs:
             Write-Host "Added $wixBin to PATH"
           }
 
-          # Set WIX environment variable for CPack WIX generator
           $wixRoot = Split-Path (Split-Path $wixBin)
           Write-Output "WIX=$wixRoot" >> $env:GITHUB_ENV
           Write-Host "WIX env set to: $wixRoot"
           Write-Host "WIX bin: $wixBin"
 
-          # Verify WiX tools
           & (Join-Path $wixBin "candle.exe") -?
           & (Join-Path $wixBin "light.exe") -?
 
       # =================================================================
-      # 8. Configure CMake
-      #    Key options from CMakeLists.txt analysis:
-      #      - CMAKE_TOOLCHAIN_FILE: vcpkg manifest mode
-      #      - Qt6_PREFIX: needed for CA bundle lookup (L563)
-      #      - KPXC_FEATURE_BROWSER=ON: browser integration
-      #      - KPXC_FEATURE_SSHAGENT=ON: SSH agent
-      #      - KPXC_FEATURE_NETWORK=ON: networking
-      #      - KPXC_FEATURE_UPDATES=ON: update checks
-      #      - KPXC_FEATURE_DOCS=ON: offline docs
-      #      - KEEPASSXC_BUILD_TYPE=Release: release build
-      #      - OVERRIDE_VERSION: version override
+      # 9. Configure CMake
       # =================================================================
       - name: Configure CMake
         shell: pwsh
@@ -235,12 +235,10 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $qtDir = $env:QT_PLUGIN_PATH
           if (-not $qtDir) {
-            # Derive Qt prefix from Qt6_DIR set by install-qt-action
             $qt6Dir = $env:Qt6_DIR
             if ($qt6Dir) {
               $qtPrefix = Resolve-Path (Join-Path $qt6Dir "..\..\..")
             } else {
-              # Fallback: use Qt install dir from the action
               $qtPrefix = Get-ChildItem "C:\Qt\*\msvc2022_64" -Directory | Select-Object -First 1 -ExpandProperty FullName
             }
           } else {
@@ -267,10 +265,7 @@ jobs:
             -DKPXC_FEATURE_DOCS=ON
 
       # =================================================================
-      # 9. Build
-      #    Uses Ninja (set by -G Ninja above) for parallel compilation.
-      #    MSVC flags from CMakeLists.txt L337-347:
-      #      /permissive- /utf-8 /MP /Zf /guard:cf (Release)
+      # 10. Build (Ninja with parallel jobs)
       # =================================================================
       - name: Build
         shell: pwsh
@@ -278,12 +273,7 @@ jobs:
           cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
       # =================================================================
-      # 10. Install
-      #     This runs the install rules including:
-      #       - windeployqt (src/CMakeLists.txt L514-530)
-      #       - CA bundle download (L562-569)
-      #       - OpenSSL DLLs are NOT needed with vcpkg (L532-560 skips
-      #         BundleUtilities and OpenSSL when VCPKG_INSTALLED_DIR is set)
+      # 11. Install (windeployqt, CA bundle, etc.)
       # =================================================================
       - name: Install
         shell: pwsh
@@ -291,7 +281,7 @@ jobs:
           cmake --install build --config ${{ env.BUILD_TYPE }}
 
       # =================================================================
-      # 11. Verify installed files
+      # 12. Verify installed files
       # =================================================================
       - name: Verify installed files
         shell: pwsh
@@ -307,7 +297,6 @@ jobs:
             }
           }
 
-          # Verify key executables exist
           $keyFiles = @(
             "install\KeePassXC.exe",
             "install\keepassxc-cli.exe",
@@ -323,14 +312,7 @@ jobs:
           }
 
       # =================================================================
-      # 12. Package with CPack
-      #     src/CMakeLists.txt L474: set(CPACK_GENERATOR "ZIP;WIX")
-      #     L477: CPACK_PACKAGE_FILE_NAME uses CMAKE_CXX_COMPILER_ARCHITECTURE_ID
-      #           which is "x64" for MSVC x86_64, producing:
-      #           KeePassXC-<VERSION>-x64.zip and KeePassXC-<VERSION>-x64.msi
-      #
-      #     We rename to match the official naming convention:
-      #           KeePassXC-<VERSION>-Win64.zip and KeePassXC-<VERSION>-Win64.msi
+      # 13. Package with CPack (ZIP + MSI) and rename to Win64 convention
       # =================================================================
       - name: Package with CPack
         id: package
@@ -339,10 +321,8 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
 
-          # Run CPack to generate ZIP and MSI
           cpack -C ${{ env.BUILD_TYPE }} -V
 
-          # Find generated packages
           Write-Host "`n=== Looking for generated packages ==="
 
           $zipPattern = "KeePassXC-*-x64.zip"
@@ -362,7 +342,7 @@ jobs:
             $zipFile = $zipFiles[0]
             $newZipName = "KeePassXC-$version-Win64.zip"
             if ($zipFile.Name -ne $newZipName) {
-              Copy-Item $zipFile.FullName $newZipName
+              Rename-Item -Path $zipFile.FullName -NewName $newZipName -ErrorAction Stop
               Write-Host "Renamed: $($zipFile.Name) -> $newZipName"
             } else {
               Write-Host "ZIP already has correct name: $newZipName"
@@ -379,7 +359,7 @@ jobs:
             $msiFile = $msiFiles[0]
             $newMsiName = "KeePassXC-$version-Win64.msi"
             if ($msiFile.Name -ne $newMsiName) {
-              Copy-Item $msiFile.FullName $newMsiName
+              Rename-Item -Path $msiFile.FullName -NewName $newMsiName -ErrorAction Stop
               Write-Host "Renamed: $($msiFile.Name) -> $newMsiName"
             } else {
               Write-Host "MSI already has correct name: $newMsiName"
@@ -393,11 +373,11 @@ jobs:
           }
 
       # =================================================================
-      # 13. Upload artifacts
+      # 14. Upload artifacts (v7 supports Node.js 24)
       # =================================================================
       - name: Upload ZIP artifact
         if: steps.package.outputs.zip_name != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.zip_name }}
           path: build/${{ steps.package.outputs.zip_name }}
@@ -405,14 +385,14 @@ jobs:
 
       - name: Upload MSI artifact
         if: steps.package.outputs.msi_name != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.msi_name }}
           path: build/${{ steps.package.outputs.msi_name }}
           retention-days: 30
 
       # =================================================================
-      # 14. Build summary
+      # 15. Build summary
       # =================================================================
       - name: Build summary
         if: always()
