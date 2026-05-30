@@ -1,0 +1,459 @@
+# ============================================================================
+# KeePassXC Windows x86_64 Build & Package Workflow
+# ============================================================================
+# Produces:
+#   - KeePassXC-<VERSION>-Win64.zip  (portable archive)
+#   - KeePassXC-<VERSION>-Win64.msi  (MSI installer via WiX)
+#
+# Toolchain:
+#   - MSVC 2022 (Visual Studio 17) on windows-2022 runner
+#   - Qt 6.x   (installed via jurplel/install-qt-action)
+#   - vcpkg    (manifest mode: botan, minizip, libqrencode, readline, zlib)
+#   - CMake + Ninja
+#   - CPack    (ZIP + WIX generators)
+#   - asciidoctor (HTML documentation)
+#
+# Key source references:
+#   - CMakeLists.txt (L17-526):  project config, Qt6 find_package, MSVC flags
+#   - vcpkg.json:                 Windows dependency manifest
+#   - src/CMakeLists.txt (L447-576): CPack ZIP;WIX, windeployqt, OpenSSL, CA bundle
+#   - share/windows/:             WiX template, patch, custom UI dialogs
+#   - release-tool.py (L753+):    Official Windows build script
+# ============================================================================
+
+name: Build Windows Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      override_version:
+        description: "Override version string (e.g. 2.7.12). Leave empty to auto-detect from CMakeLists.txt."
+        required: false
+        default: ""
+      build_type:
+        description: "Build type"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+      qt_version:
+        description: "Qt version to install (>= 6.2.4, tested with 6.8.3)"
+        required: false
+        default: "6.8.3"
+
+  push:
+    branches:
+      - develop
+      - master
+      - main
+      - "release/**"
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+  QT_VERSION: ${{ github.event.inputs.qt_version || '6.8.3' }}
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+
+jobs:
+  build-windows:
+    name: Build Win64 (MSVC + Qt6 + vcpkg)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      # =================================================================
+      # 1. Checkout source code
+      # =================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # =================================================================
+      # 2. Determine version from CMakeLists.txt
+      # =================================================================
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event.inputs.override_version }}" -ne "") {
+            $version = "${{ github.event.inputs.override_version }}"
+            Write-Host "Using override version: $version"
+          } else {
+            # Extract version from CMakeLists.txt
+            # Lines: set(KEEPASSXC_VERSION_MAJOR "2"), etc.
+            $major = (Select-String -Path CMakeLists.txt -Pattern 'KEEPASSXC_VERSION_MAJOR\s+"(\d+)"').Matches.Groups[1].Value
+            $minor = (Select-String -Path CMakeLists.txt -Pattern 'KEEPASSXC_VERSION_MINOR\s+"(\d+)"').Matches.Groups[1].Value
+            $patch = (Select-String -Path CMakeLists.txt -Pattern 'KEEPASSXC_VERSION_PATCH\s+"(\d+)"').Matches.Groups[1].Value
+            $version = "$major.$minor.$patch"
+            Write-Host "Detected version from CMakeLists.txt: $version"
+          }
+          Write-Output "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Build version: $version"
+
+      # =================================================================
+      # 3. Setup MSVC Developer Environment
+      #    windows-2022 runner has VS 2022 pre-installed.
+      #    We use the VCVars all-in-one action to set up the x64 env.
+      # =================================================================
+      - name: Setup MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      # =================================================================
+      # 4. Install Qt 6
+      #    Components match CMakeLists.txt L413:
+      #      set(QT_COMPONENTS Core Network Concurrent Gui Svg Widgets Test LinguistTools)
+      #    Plus SvgWidgets from src/CMakeLists.txt L327.
+      #    Also need qtbase for windeployqt.
+      # =================================================================
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtimageformats qtsvg
+          cache: true
+
+      # =================================================================
+      # 5. Install asciidoctor for offline docs
+      #    CMakeLists.txt L69: option(KPXC_FEATURE_DOCS "Build offline
+      #    documentation; requires asciidoctor tool" ON)
+      #    docs/CMakeLists.txt uses asciidoctor to generate HTML docs.
+      # =================================================================
+      - name: Install asciidoctor
+        shell: pwsh
+        run: |
+          gem install asciidoctor --no-document
+          asciidoctor --version
+          Write-Host "asciidoctor installed successfully"
+
+      # =================================================================
+      # 6. Setup vcpkg (uses built-in on runner)
+      #    The project uses vcpkg manifest mode (vcpkg.json).
+      #    Dependencies: botan, minizip, libqrencode, readline, zlib
+      #    CMakeLists.txt L704 adds CMAKE_TOOLCHAIN_FILE automatically.
+      # =================================================================
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          # Use the vcpkg bundled with the GitHub Actions runner
+          $vcpkgRoot = "$env:VCPKG_INSTALLATION_ROOT"
+          if (-not $vcpkgRoot -or -not (Test-Path $vcpkgRoot)) {
+            Write-Host "VCPKG_INSTALLATION_ROOT not set, using default location"
+            $vcpkgRoot = "C:\vcpkg"
+          }
+          Write-Host "vcpkg root: $vcpkgRoot"
+
+          # Verify vcpkg executable exists
+          $vcpkgExe = Join-Path $vcpkgRoot "vcpkg.exe"
+          if (-not (Test-Path $vcpkgExe)) {
+            Write-Error "vcpkg.exe not found at $vcpkgExe"
+            exit 1
+          }
+
+          # Bootstrap vcpkg (ensure it's ready)
+          & $vcpkgExe --version
+
+          # Set environment variables for CMake to find vcpkg
+          $toolchainFile = Join-Path $vcpkgRoot "scripts" "buildsystems" "vcpkg.cmake"
+          if (-not (Test-Path $toolchainFile)) {
+            Write-Error "vcpkg toolchain file not found at $toolchainFile"
+            exit 1
+          }
+          Write-Output "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          Write-Output "VCPKG_TOOLCHAIN_FILE=$toolchainFile" >> $env:GITHUB_ENV
+          Write-Host "vcpkg toolchain: $toolchainFile"
+
+      # =================================================================
+      # 7. Install WiX v3 for MSI packaging
+      #    src/CMakeLists.txt L474: set(CPACK_GENERATOR "ZIP;WIX")
+      #    WiX v3 is required (not v4) because CPack's WIX generator
+      #    uses WiX v3 candle.exe/light.exe directly.
+      # =================================================================
+      - name: Install WiX v3
+        shell: pwsh
+        run: |
+          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+          if ($candle) {
+            Write-Host "WiX already available: $($candle.Source)"
+            $wixBin = Split-Path $candle.Source
+          } else {
+            Write-Host "Installing WiX v3.14.1..."
+            $url = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314.exe"
+            $installer = "$env:TEMP\wix314.exe"
+            Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRetryCount 3
+            Start-Process -FilePath $installer -ArgumentList "/quiet", "/norestart" -Wait
+
+            # Locate the installed WiX bin directory
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin",
+              "${env:ProgramFiles}\WiX Toolset v3.14\bin"
+            )
+            $wixBin = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $wixBin) {
+              Write-Error "Cannot find WiX installation directory after install"
+              exit 1
+            }
+            Add-Content $env:GITHUB_PATH "$wixBin"
+            Write-Host "Added $wixBin to PATH"
+          }
+
+          # Set WIX environment variable for CPack WIX generator
+          $wixRoot = Split-Path (Split-Path $wixBin)
+          Write-Output "WIX=$wixRoot" >> $env:GITHUB_ENV
+          Write-Host "WIX env set to: $wixRoot"
+          Write-Host "WIX bin: $wixBin"
+
+          # Verify WiX tools
+          & (Join-Path $wixBin "candle.exe") -?
+          & (Join-Path $wixBin "light.exe") -?
+
+      # =================================================================
+      # 8. Configure CMake
+      #    Key options from CMakeLists.txt analysis:
+      #      - CMAKE_TOOLCHAIN_FILE: vcpkg manifest mode
+      #      - Qt6_PREFIX: needed for CA bundle lookup (L563)
+      #      - KPXC_FEATURE_BROWSER=ON: browser integration (L55)
+      #      - KPXC_FEATURE_SSHAGENT=ON: SSH agent (L56)
+      #      - KPXC_FEATURE_NETWORK=ON: networking (L67)
+      #      - KPXC_FEATURE_UPDATES=ON: update checks (L68)
+      #      - KPXC_FEATURE_DOCS=ON: offline docs (L69)
+      #      - KEEPASSXC_BUILD_TYPE=Release: release build (L717)
+      #      - OVERRIDE_VERSION: version override (L107)
+      # =================================================================
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $qtDir = $env:QT_PLUGIN_PATH
+          if (-not $qtDir) {
+            # Derive Qt prefix from Qt6_DIR set by install-qt-action
+            $qt6Dir = $env:Qt6_DIR
+            if ($qt6Dir) {
+              $qtPrefix = Resolve-Path (Join-Path $qt6Dir "..\..\..")
+            } else {
+              # Fallback: use Qt install dir from the action
+              $qtPrefix = Get-ChildItem "C:\Qt\*\msvc2022_64" -Directory | Select-Object -First 1 -ExpandProperty FullName
+            }
+          } else {
+            $qtPrefix = Split-Path (Split-Path $qtDir)
+          }
+
+          Write-Host "Qt6_PREFIX: $qtPrefix"
+          Write-Host "Qt6_DIR: $env:Qt6_DIR"
+          Write-Host "vcpkg toolchain: $env:VCPKG_TOOLCHAIN_FILE"
+
+          cmake -G Ninja -B build `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_INSTALL_PREFIX="$PWD\install" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN_FILE" `
+            -DQt6_PREFIX="$qtPrefix" `
+            -DKEEPASSXC_BUILD_TYPE=Release `
+            -DOVERRIDE_VERSION="$version" `
+            -DWITH_TESTS=OFF `
+            -DWITH_GUI_TESTS=OFF `
+            -DKPXC_FEATURE_BROWSER=ON `
+            -DKPXC_FEATURE_SSHAGENT=ON `
+            -DKPXC_FEATURE_NETWORK=ON `
+            -DKPXC_FEATURE_UPDATES=ON `
+            -DKPXC_FEATURE_DOCS=ON
+
+      # =================================================================
+      # 9. Build
+      #    Uses Ninja (set by -G Ninja above) for parallel compilation.
+      #    MSVC flags from CMakeLists.txt L337-347:
+      #      /permissive- /utf-8 /MP /Zf /guard:cf (Release)
+      # =================================================================
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      # =================================================================
+      # 10. Install
+      #     This runs the install rules including:
+      #       - windeployqt (src/CMakeLists.txt L514-530)
+      #       - CA bundle download (L562-569)
+      #       - OpenSSL DLLs are NOT needed with vcpkg (L532-560 skips
+      #         BundleUtilities and OpenSSL when VCPKG_INSTALLED_DIR is set)
+      # =================================================================
+      - name: Install
+        shell: pwsh
+        run: |
+          cmake --install build --config ${{ env.BUILD_TYPE }}
+
+      # =================================================================
+      # 11. Verify installed files
+      # =================================================================
+      - name: Verify installed files
+        shell: pwsh
+        run: |
+          Write-Host "=== Installed files ==="
+          Get-ChildItem -Path install -Recurse | ForEach-Object {
+            $relativePath = $_.FullName.Substring($PWD.Path.Length + 9)
+            if ($_.PSIsContainer) {
+              Write-Host "  [DIR]  $relativePath"
+            } else {
+              $size = [math]::Round($_.Length / 1KB, 1)
+              Write-Host "  [FILE] $relativePath ($size KB)"
+            }
+          }
+
+          # Verify key executables exist
+          $keyFiles = @(
+            "install\KeePassXC.exe",
+            "install\keepassxc-cli.exe",
+            "install\keepassxc-proxy.exe"
+          )
+          foreach ($f in $keyFiles) {
+            if (Test-Path $f) {
+              $size = [math]::Round((Get-Item $f).Length / 1MB, 2)
+              Write-Host "OK: $f ($size MB)"
+            } else {
+              Write-Error "MISSING: $f"
+            }
+          }
+
+      # =================================================================
+      # 12. Package with CPack
+      #     src/CMakeLists.txt L474: set(CPACK_GENERATOR "ZIP;WIX")
+      #     L477: CPACK_PACKAGE_FILE_NAME uses CMAKE_CXX_COMPILER_ARCHITECTURE_ID
+      #           which is "x64" for MSVC x86_64, producing:
+      #           KeePassXC-<VERSION>-x64.zip and KeePassXC-<VERSION>-x64.msi
+      #
+      #     We rename to match the official naming convention:
+      #           KeePassXC-<VERSION>-Win64.zip and KeePassXC-<VERSION>-Win64.msi
+      # =================================================================
+      - name: Package with CPack
+        id: package
+        shell: pwsh
+        working-directory: build
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+
+          # Run CPack to generate ZIP and MSI
+          cpack -C ${{ env.BUILD_TYPE }} -V
+
+          # Find generated packages
+          Write-Host "`n=== Looking for generated packages ==="
+
+          # CPack generates: KeePassXC-<VERSION>-x64.zip / .msi
+          # (CMAKE_CXX_COMPILER_ARCHITECTURE_ID = x64 for MSVC x86_64)
+          $zipPattern = "KeePassXC-*-x64.zip"
+          $msiPattern = "KeePassXC-*-x64.msi"
+
+          $zipFiles = Get-ChildItem -Path . -Filter $zipPattern
+          $msiFiles = Get-ChildItem -Path . -Filter $msiPattern
+
+          # Also check for Win64 naming (in case CMakeLists.txt was modified)
+          if (-not $zipFiles) {
+            $zipFiles = Get-ChildItem -Path . -Filter "KeePassXC-*-Win64.zip"
+          }
+          if (-not $msiFiles) {
+            $msiFiles = Get-ChildItem -Path . -Filter "KeePassXC-*-Win64.msi"
+          }
+
+          # Rename x64 -> Win64 to match official release naming
+          if ($zipFiles) {
+            $zipFile = $zipFiles[0]
+            $newZipName = "KeePassXC-$version-Win64.zip"
+            if ($zipFile.Name -ne $newZipName) {
+              Copy-Item $zipFile.FullName $newZipName
+              Write-Host "Renamed: $($zipFile.Name) -> $newZipName"
+            } else {
+              Write-Host "ZIP already has correct name: $newZipName"
+            }
+            $size = [math]::Round((Get-Item $newZipName).Length / 1MB, 2)
+            Write-Host "ZIP package: $newZipName ($size MB)"
+            Write-Output "zip_name=$newZipName" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning "No ZIP package found!"
+            # List all files for debugging
+            Get-ChildItem -Path . -Filter "*.zip" | ForEach-Object { Write-Host "  Found: $($_.Name)" }
+          }
+
+          if ($msiFiles) {
+            $msiFile = $msiFiles[0]
+            $newMsiName = "KeePassXC-$version-Win64.msi"
+            if ($msiFile.Name -ne $newMsiName) {
+              Copy-Item $msiFile.FullName $newMsiName
+              Write-Host "Renamed: $($msiFile.Name) -> $newMsiName"
+            } else {
+              Write-Host "MSI already has correct name: $newMsiName"
+            }
+            $size = [math]::Round((Get-Item $newMsiName).Length / 1MB, 2)
+            Write-Host "MSI package: $newMsiName ($size MB)"
+            Write-Output "msi_name=$newMsiName" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning "No MSI package found! (WiX packaging may have failed)"
+            Get-ChildItem -Path . -Filter "*.msi" | ForEach-Object { Write-Host "  Found: $($_.Name)" }
+          }
+
+      # =================================================================
+      # 13. Upload artifacts
+      # =================================================================
+      - name: Upload ZIP artifact
+        if: steps.package.outputs.zip_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip_name }}
+          path: build/${{ steps.package.outputs.zip_name }}
+          retention-days: 30
+
+      - name: Upload MSI artifact
+        if: steps.package.outputs.msi_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.msi_name }}
+          path: build/${{ steps.package.outputs.msi_name }}
+          retention-days: 30
+
+      # =================================================================
+      # 14. Build summary
+      # =================================================================
+      - name: Build summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "  KeePassXC Windows Build Summary"
+          Write-Host "============================================"
+          Write-Host "  Version:     ${{ steps.version.outputs.version }}"
+          Write-Host "  Build Type:  $env:BUILD_TYPE"
+          Write-Host "  Qt Version:  $env:QT_VERSION"
+          Write-Host "  Compiler:    MSVC 2022 (x86_64)"
+          Write-Host "  vcpkg:       manifest mode (x64-windows)"
+          Write-Host "--------------------------------------------"
+          Write-Host "  Artifacts:"
+
+          $zipName = "${{ steps.package.outputs.zip_name }}"
+          $msiName = "${{ steps.package.outputs.msi_name }}"
+
+          if ($zipName -and (Test-Path "build\$zipName")) {
+            $size = [math]::Round((Get-Item "build\$zipName").Length / 1MB, 2)
+            Write-Host "    ZIP: $zipName ($size MB)"
+          } else {
+            Write-Host "    ZIP: NOT FOUND"
+          }
+
+          if ($msiName -and (Test-Path "build\$msiName")) {
+            $size = [math]::Round((Get-Item "build\$msiName").Length / 1MB, 2)
+            Write-Host "    MSI: $msiName ($size MB)"
+          } else {
+            Write-Host "    MSI: NOT FOUND (or WiX packaging failed)"
+          }
+
+          Write-Host "============================================"
+          Write-Host ""
