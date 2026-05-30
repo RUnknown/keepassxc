@@ -18,7 +18,7 @@
 #   - vcpkg.json:                 Windows dependency manifest
 #   - src/CMakeLists.txt (L447-576): CPack ZIP;WIX, windeployqt, OpenSSL, CA bundle
 #   - share/windows/:             WiX template, patch, custom UI dialogs
-#   - release-tool.py (L753+):    Official Windows build script
+#   - release-tool.ps1:           Official Windows PowerShell build script
 # ============================================================================
 
 name: Build Windows Setup
@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       override_version:
-        description: "Override version string (e.g. 2.7.12). Leave empty to auto-detect from CMakeLists.txt."
+        description: "Override version string (e.g. 2.8.0). Leave empty to auto-detect from CMakeLists.txt."
         required: false
         default: ""
       build_type:
@@ -88,7 +88,6 @@ jobs:
             Write-Host "Using override version: $version"
           } else {
             # Extract version from CMakeLists.txt
-            # Lines: set(KEEPASSXC_VERSION_MAJOR "2"), etc.
             $major = (Select-String -Path CMakeLists.txt -Pattern 'KEEPASSXC_VERSION_MAJOR\s+"(\d+)"').Matches.Groups[1].Value
             $minor = (Select-String -Path CMakeLists.txt -Pattern 'KEEPASSXC_VERSION_MINOR\s+"(\d+)"').Matches.Groups[1].Value
             $patch = (Select-String -Path CMakeLists.txt -Pattern 'KEEPASSXC_VERSION_PATCH\s+"(\d+)"').Matches.Groups[1].Value
@@ -110,10 +109,9 @@ jobs:
 
       # =================================================================
       # 4. Install Qt 6
-      #    Components match CMakeLists.txt L413:
-      #      set(QT_COMPONENTS Core Network Concurrent Gui Svg Widgets Test LinguistTools)
-      #    Plus SvgWidgets from src/CMakeLists.txt L327.
-      #    Also need qtbase for windeployqt.
+      #    KeePassXC needs Core, Network, Concurrent, Gui, Svg, Widgets, Test, LinguistTools.
+      #    The default Qt installation includes all necessary modules.
+      #    No explicit modules list required (avoids aqt parser errors for qtsvg).
       # =================================================================
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -122,7 +120,6 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: qtimageformats qtsvg
           cache: true
 
       # =================================================================
@@ -224,13 +221,13 @@ jobs:
       #    Key options from CMakeLists.txt analysis:
       #      - CMAKE_TOOLCHAIN_FILE: vcpkg manifest mode
       #      - Qt6_PREFIX: needed for CA bundle lookup (L563)
-      #      - KPXC_FEATURE_BROWSER=ON: browser integration (L55)
-      #      - KPXC_FEATURE_SSHAGENT=ON: SSH agent (L56)
-      #      - KPXC_FEATURE_NETWORK=ON: networking (L67)
-      #      - KPXC_FEATURE_UPDATES=ON: update checks (L68)
-      #      - KPXC_FEATURE_DOCS=ON: offline docs (L69)
-      #      - KEEPASSXC_BUILD_TYPE=Release: release build (L717)
-      #      - OVERRIDE_VERSION: version override (L107)
+      #      - KPXC_FEATURE_BROWSER=ON: browser integration
+      #      - KPXC_FEATURE_SSHAGENT=ON: SSH agent
+      #      - KPXC_FEATURE_NETWORK=ON: networking
+      #      - KPXC_FEATURE_UPDATES=ON: update checks
+      #      - KPXC_FEATURE_DOCS=ON: offline docs
+      #      - KEEPASSXC_BUILD_TYPE=Release: release build
+      #      - OVERRIDE_VERSION: version override
       # =================================================================
       - name: Configure CMake
         shell: pwsh
@@ -348,15 +345,12 @@ jobs:
           # Find generated packages
           Write-Host "`n=== Looking for generated packages ==="
 
-          # CPack generates: KeePassXC-<VERSION>-x64.zip / .msi
-          # (CMAKE_CXX_COMPILER_ARCHITECTURE_ID = x64 for MSVC x86_64)
           $zipPattern = "KeePassXC-*-x64.zip"
           $msiPattern = "KeePassXC-*-x64.msi"
 
           $zipFiles = Get-ChildItem -Path . -Filter $zipPattern
           $msiFiles = Get-ChildItem -Path . -Filter $msiPattern
 
-          # Also check for Win64 naming (in case CMakeLists.txt was modified)
           if (-not $zipFiles) {
             $zipFiles = Get-ChildItem -Path . -Filter "KeePassXC-*-Win64.zip"
           }
@@ -364,7 +358,6 @@ jobs:
             $msiFiles = Get-ChildItem -Path . -Filter "KeePassXC-*-Win64.msi"
           }
 
-          # Rename x64 -> Win64 to match official release naming
           if ($zipFiles) {
             $zipFile = $zipFiles[0]
             $newZipName = "KeePassXC-$version-Win64.zip"
@@ -379,7 +372,6 @@ jobs:
             Write-Output "zip_name=$newZipName" >> $env:GITHUB_OUTPUT
           } else {
             Write-Warning "No ZIP package found!"
-            # List all files for debugging
             Get-ChildItem -Path . -Filter "*.zip" | ForEach-Object { Write-Host "  Found: $($_.Name)" }
           }
 
