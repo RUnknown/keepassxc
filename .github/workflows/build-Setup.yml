@@ -262,7 +262,8 @@ jobs:
             -DKPXC_FEATURE_SSHAGENT=ON `
             -DKPXC_FEATURE_NETWORK=ON `
             -DKPXC_FEATURE_UPDATES=ON `
-            -DKPXC_FEATURE_DOCS=ON
+            -DKPXC_FEATURE_DOCS=ON `
+            -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON
 
       # =================================================================
       # 10. Build (Ninja with parallel jobs)
